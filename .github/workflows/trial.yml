@@ -1,0 +1,170 @@
+name: x64 baseline trial
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    name: Fetch ${{ matrix.set }} bindings from npm
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { set: good, oxlint: 1.94.0, oxfmt: 0.79.0 }
+          - { set: bad, oxlint: 1.95.0, oxfmt: 0.80.0 }
+    steps:
+      - run: |
+          mkdir oxlint oxfmt
+          npm pack --silent "@oxlint/binding-linux-x64-gnu@${{ matrix.oxlint }}"
+          npm pack --silent "@oxfmt/binding-linux-x64-gnu@${{ matrix.oxfmt }}"
+          tar xzf oxlint-binding-linux-x64-gnu-*.tgz -C oxlint --strip-components=1
+          tar xzf oxfmt-binding-linux-x64-gnu-*.tgz -C oxfmt --strip-components=1
+          ls -l oxlint/*.node oxfmt/*.node
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.set }}-oxlint-bindings-x86_64-unknown-linux-gnu
+          path: oxlint/*.node
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.set }}-oxfmt-bindings-x86_64-unknown-linux-gnu
+          path: oxfmt/*.node
+          if-no-files-found: error
+
+  # Option C: the proposed job. Only the artifact pattern and the
+  # "Show versions" step differ.
+  check-x64-baseline:
+    name: "C: container, ${{ matrix.set }}"
+    needs: fetch
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [good, bad]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: node:22.23.5-trixie-slim@sha256:f0960f8dc047f358e3fb428f36ccba21732194fa5f0cac849f401e63e62fb9e6
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "${{ matrix.set }}-*-bindings-x86_64-unknown-linux-gnu"
+          path: bindings
+          merge-multiple: true
+      - name: Install QEMU
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends qemu-user
+      - name: Show versions
+        run: |
+          grep PRETTY_NAME /etc/os-release
+          qemu-x86_64 --version | head -1
+          /usr/local/bin/node --version
+          ls -l bindings
+      - name: Load each binding
+        run: |
+          for cpu in qemu64 Nehalem; do
+            for f in bindings/*.node; do
+              echo "$cpu: $f"
+              qemu-x86_64 -cpu "$cpu" /usr/local/bin/node -e "require('./$f')"
+            done
+          done
+
+  # Optional add-on: lint and format one file, also on Ivy Bridge.
+  fixture:
+    name: "C + fixture: ${{ matrix.set }}"
+    needs: fetch
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [good, bad]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: node:22.23.5-trixie-slim@sha256:f0960f8dc047f358e3fb428f36ccba21732194fa5f0cac849f401e63e62fb9e6
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "${{ matrix.set }}-*-bindings-x86_64-unknown-linux-gnu"
+          path: bindings
+          merge-multiple: true
+      - name: Install QEMU
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends qemu-user
+      - name: Lint and format one file
+        run: |
+          printf 'export const n=1\n' > smoke.js
+          cat > fixture.mjs <<'EOF'
+          import assert from "node:assert/strict";
+          import {readFileSync} from "node:fs";
+          import {createRequire} from "node:module";
+          const [app, path] = process.argv.slice(2);
+          const b = createRequire(import.meta.url)(path);
+          const unused = () => { throw Error("Unexpected plugin callback"); };
+          if (app === "oxlint") {
+            assert.equal(await b.lint(["--threads", "1", "smoke.js"],
+              unused, unused, unused, async () => {}, () => {}, unused), true);
+          } else {
+            const r = await b.format("smoke.js", readFileSync("smoke.js", "utf8"),
+              {semi: true}, unused, unused, unused);
+            assert.deepEqual(r.errors, []);
+            assert.equal(r.code, "export const n = 1;\n");
+          }
+          console.log("ok", app);
+          EOF
+          for cpu in qemu64,pni=off,cx16=off,lahf-lm=off Nehalem IvyBridge; do
+            echo "== $cpu"
+            qemu-x86_64 -cpu "$cpu" /usr/local/bin/node fixture.mjs oxlint ./bindings/oxlint.linux-x64-gnu.node
+            qemu-x86_64 -cpu "$cpu" /usr/local/bin/node fixture.mjs oxfmt ./bindings/oxfmt.linux-x64-gnu.node
+          done
+
+  # Option B: no container, ubuntu-24.04 and its QEMU 8.2.
+  option-b:
+    name: "B: ubuntu-24.04, ${{ matrix.set }}"
+    needs: fetch
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [good, bad]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "${{ matrix.set }}-*-bindings-x86_64-unknown-linux-gnu"
+          path: bindings
+          merge-multiple: true
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+      - name: Load each binding
+        run: |
+          qemu-x86_64 --version | head -1
+          node=$(node -p process.execPath)
+          echo "$node $(node --version)"
+          for cpu in qemu64 Nehalem; do
+            for f in bindings/*.node; do
+              echo "$cpu: $f"
+              qemu-x86_64 -cpu "$cpu" "$node" -e "require('./$f')"
+            done
+          done
+
+  # Control: the ubuntu-latest userland under an emulated v2 CPU.
+  control:
+    name: "Control: ubuntu-latest userland under Nehalem"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          grep PRETTY_NAME /etc/os-release
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          qemu-x86_64 --version | head -1
+          if qemu-x86_64 -cpu Nehalem /bin/true; then
+            echo "RESULT: /bin/true ran"
+          else
+            echo "RESULT: /bin/true failed with exit $?"
+          fi
